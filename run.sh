@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 週次パイプライン: 米国先行サービスをリサーチ → レポート生成 → LINE一斉配信
+# 週次パイプライン:
+#   米国先行サービスをリサーチ → 要約ページ(GitHub Pages)を公開 → LINEにカード配信
 #
 # 使い方:
-#   ./run.sh            本番実行（生成 → archive保存 → excluded更新 → LINE配信）
-#   ./run.sh --dry-run  配信せず、分割後メッセージをターミナル表示（excludedも更新しない）
+#   ./run.sh            本番実行
+#   ./run.sh --dry-run  配信・push せず、カード内容とページを手元で確認
 #
 # cron から起動される前提のため、すべて絶対パスで動く。
 # どの工程で失敗しても LINE への配信は行わず、理由をログに残して終了する。
@@ -12,14 +13,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# cron は PATH がほぼ空なので、claude / python3 の一般的な設置場所を明示的に足す
+# cron は PATH がほぼ空なので、claude / python3 / git の一般的な設置場所を明示的に足す
 export PATH="/opt/node22/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.claude/local:/usr/bin:/bin:$PATH"
 
 LOG_DIR="$SCRIPT_DIR/logs"
 ARCHIVE_DIR="$SCRIPT_DIR/archive"
-mkdir -p "$LOG_DIR" "$ARCHIVE_DIR"
+DOCS_DIR="$SCRIPT_DIR/docs"
+mkdir -p "$LOG_DIR" "$ARCHIVE_DIR" "$DOCS_DIR"
 
-TODAY="$(date +%F)"                                   # YYYY-MM-DD
+TODAY="$(date +%F)"
 DATE_JP="$(python3 -c 'import datetime as d; t=d.date.today(); print(f"{t.year}/{t.month}/{t.day}")')"
 LOG_FILE="$LOG_DIR/$TODAY.log"
 
@@ -31,7 +33,6 @@ fail() { log "ERROR: $*"; log "LINE配信は行わず終了します"; exit 1; }
 on_err() { fail "予期しないエラーで中断（run.sh ${1}行目付近）"; }
 trap 'on_err $LINENO' ERR
 
-# 7日より古いログを削除
 find "$LOG_DIR" -type f -mtime +7 -delete 2>/dev/null || true
 
 # 多重起動防止ロック（12時間超の残留ロックはクラッシュ由来とみなして解除）
@@ -52,23 +53,38 @@ trap cleanup EXIT
 TMP_DIR="$(mktemp -d)"
 
 ARCHIVE_FILE="$ARCHIVE_DIR/$TODAY.md"
+DATA_FILE="$ARCHIVE_DIR/$TODAY.json"
 SENT_MARKER="$LOG_DIR/sent-$TODAY"
-[ "$DRY_RUN" = 1 ] && ARCHIVE_FILE="$ARCHIVE_DIR/$TODAY.dryrun.md"
+if [ "$DRY_RUN" = 1 ]; then
+  ARCHIVE_FILE="$ARCHIVE_DIR/$TODAY.dryrun.md"
+  DATA_FILE="$ARCHIVE_DIR/$TODAY.dryrun.json"
+fi
 
 log "=== 実行開始 (dry-run=$DRY_RUN) ==="
 
+# --- 公開ページのベースURL（git remote から自動導出） ---------------------
+# 例: https://github.com/owner/repo → https://owner.github.io/repo
+if [ -z "${PAGE_BASE_URL:-}" ]; then
+  REMOTE="$(git -C "$SCRIPT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+  PAGE_BASE_URL="$(python3 - "$REMOTE" <<'PY'
+import re, sys
+m = re.search(r"github\.com[:/]+([^/]+)/([^/.]+)", sys.argv[1] or "")
+print(f"https://{m.group(1).lower()}.github.io/{m.group(2)}" if m else "")
+PY
+)"
+fi
+[ -n "$PAGE_BASE_URL" ] || fail "公開ページのURLを判定できません（PAGE_BASE_URL を設定してください）"
+PAGE_URL="$PAGE_BASE_URL/$TODAY.html"
+
 # --- 二重配信防止 ---------------------------------------------------------
-# 配信済みマーカーがあれば何もしない。
-# archive だけあってマーカーが無い場合は「生成成功・配信失敗」なので、
-# 再生成せず同じ本文・同じRetry-Keyで配信だけ再試行する。
 SKIP_GEN=0
 if [ "$DRY_RUN" = 0 ]; then
   if [ -f "$SENT_MARKER" ]; then
     log "本日分（$TODAY）は配信済みのため何もしません"
     exit 0
   fi
-  if [ -f "$ARCHIVE_FILE" ]; then
-    log "本日分の生成済みレポートを再利用し、配信のみ再試行します"
+  if [ -f "$ARCHIVE_FILE" ] && [ -f "$DATA_FILE" ]; then
+    log "本日分の生成済みレポートを再利用し、公開・配信のみ再試行します"
     SKIP_GEN=1
   fi
 fi
@@ -81,7 +97,6 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$EXCLUDED_JSON" \
 
 if [ "$SKIP_GEN" = 0 ]; then
   # --- 2) claude -p でリサーチ・本文生成 ----------------------------------
-  # vol番号は archive/ の本番レポート数 + 1（dry-runの産物は数えない）
   VOL=$(( $(find "$ARCHIVE_DIR" -maxdepth 1 -name '*.md' ! -name '*.dryrun.md' | wc -l) + 1 ))
   log "vol.$VOL としてレポートを生成します（日付: $DATE_JP）"
 
@@ -96,7 +111,7 @@ sys.stdout.write(tpl.replace("{{EXCLUDED}}", lines)
 PY
 
   CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
-  [ -n "$CLAUDE_BIN" ] || fail "claude CLI が見つかりません（PATH: 主要な場所を確認済み）"
+  [ -n "$CLAUDE_BIN" ] || fail "claude CLI が見つかりません"
   log "claude によるリサーチ・本文生成を開始（数分かかります）"
   if ! "$CLAUDE_BIN" -p --allowedTools "WebSearch,WebFetch" \
         < "$TMP_DIR/prompt.txt" > "$TMP_DIR/report.raw" 2> "$TMP_DIR/claude.err"; then
@@ -105,11 +120,12 @@ PY
   fi
 
   # --- 3) 生成物を検証して archive/ に保存 --------------------------------
-  # 不正な本文はここで弾く。半端な状態でLINEに飛ばさない。
-  COMPANIES="$(python3 - "$TMP_DIR/report.raw" "$ARCHIVE_FILE" "$DATE_JP" "$VOL" 2>"$TMP_DIR/validate.err" <<'PY'
-import re, sys
+  # 本文とカード用JSONの両方をここで厳密に検証する。半端な状態でLINEに飛ばさない。
+  COMPANIES="$(python3 - "$TMP_DIR/report.raw" "$ARCHIVE_FILE" "$DATA_FILE" "$DATE_JP" "$VOL" \
+      2>"$TMP_DIR/validate.err" <<'PY'
+import json, re, sys
 raw = open(sys.argv[1], encoding="utf-8").read().strip()
-archive, date_jp, vol = sys.argv[2], sys.argv[3], sys.argv[4]
+archive, data_path, date_jp, vol = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 def die(msg):
     print(f"検証NG: {msg}", file=sys.stderr)
@@ -117,29 +133,52 @@ def die(msg):
 
 if not raw:
     die("生成結果が空")
+
 header = raw.splitlines()[0].strip()
 expect = f"【米国先行サービス→日本落とし込み】{date_jp} vol.{vol}"
 if header != expect:
     die(f"1行目が不正: {header!r}（期待: {expect!r}）")
-for i in range(1, 7):
-    if f"【{i}】" not in raw:
-        die(f"【{i}】のブロックが見つからない")
-m = re.search(r"^@@COMPANIES:(.+?)@@\s*$", raw, re.M)
+
+m = re.search(r"^@@DATA$\s*(.+?)\s*^@@END$", raw, re.M | re.S)
 if not m:
-    die("@@COMPANIES 行が見つからない")
-names = [n.strip() for n in m.group(1).split("|") if n.strip()]
-if len(names) != 6:
-    die(f"@@COMPANIES の社名が6件でない（{len(names)}件）")
-body = re.sub(r"^@@COMPANIES:.*$", "", raw, flags=re.M).strip() + "\n"
+    die("@@DATA〜@@END ブロックが見つからない")
+try:
+    data = json.loads(m.group(1))
+except ValueError as e:
+    die(f"カード用JSONが壊れている: {e}")
+
+companies = data.get("companies")
+if not isinstance(companies, list) or not 3 <= len(companies) <= 5:
+    die(f"companies は3〜5件である必要がある（{len(companies) if isinstance(companies, list) else '不正'}）")
+for i, c in enumerate(companies, 1):
+    for key in ("name", "tagline", "card", "source_url"):
+        if not c.get(key):
+            die(f"companies[{i}] に {key} がない")
+    if not isinstance(c["card"], list) or not c["card"]:
+        die(f"companies[{i}] の card が配列でない")
+    if not str(c["source_url"]).startswith(("http://", "https://")):
+        die(f"companies[{i}] の source_url がURLでない: {c['source_url']!r}")
+
+body = raw[:m.start()].strip() + "\n"
+blocks = [b for b in re.split(r"^─{3,}\s*$", body, flags=re.M) if b.strip()]
+found = [b for b in blocks if re.match(r"^【\d+】", b.strip())]
+if len(found) != len(companies):
+    die(f"本文の企業ブロック数({len(found)})とcompanies件数({len(companies)})が不一致")
+for i in range(1, len(companies) + 1):
+    if f"【{i}】" not in body:
+        die(f"【{i}】のブロックが見つからない")
 if "**" in body or re.search(r"^#{1,6} ", body, re.M):
     die("本文にMarkdown記法（** や #）が残っている")
+
 open(archive, "w", encoding="utf-8").write(body)
-print(" | ".join(names))
+with open(data_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+print(" | ".join(c["name"] for c in companies))
 PY
-  )" || { log "検証エラー: $(cat "$TMP_DIR/validate.err" 2>/dev/null | tr '\n' ' ')"; fail "生成された本文が検証を通りませんでした"; }
+  )" || { log "検証エラー: $(tr '\n' ' ' < "$TMP_DIR/validate.err" 2>/dev/null)"; fail "生成された本文が検証を通りませんでした"; }
   log "archive に保存しました: $ARCHIVE_FILE"
 
-  # --- 4) 今回の6社を excluded.json に追記（dry-run では更新しない） ------
+  # --- 4) 今回の企業を excluded.json に追記（dry-run では更新しない） -----
   if [ "$DRY_RUN" = 0 ]; then
     python3 - "$EXCLUDED_JSON" "$COMPANIES" <<'PY'
 import json, sys
@@ -153,21 +192,60 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
 PY
-    log "excluded.json に6社を追記しました: $COMPANIES"
+    log "excluded.json に追記しました: $COMPANIES"
   else
     log "dry-run のため excluded.json は更新しません（対象: $COMPANIES）"
   fi
 fi
 
-# --- 5) LINE配信 ----------------------------------------------------------
+# vol番号を確定（再利用時も archive のヘッダーから読み直す）
+VOL="$(head -1 "$ARCHIVE_FILE" | sed -n 's/.*vol\.\([0-9]*\).*/\1/p')"
+[ -n "$VOL" ] || fail "vol番号を判定できませんでした"
+
+# --- 5) 要約ページを生成 --------------------------------------------------
+python3 "$SCRIPT_DIR/build_page.py" --body "$ARCHIVE_FILE" --data "$DATA_FILE" \
+  --out-dir "$DOCS_DIR" --date "$TODAY" --date-jp "$DATE_JP" --vol "$VOL" 2>&1 | tee -a "$LOG_FILE" \
+  || fail "要約ページの生成に失敗しました"
+
+# --- 6) ページを公開（git push）してから配信 ------------------------------
+if [ "$DRY_RUN" = 0 ]; then
+  BRANCH="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD)"
+  log "要約ページを公開します（branch: $BRANCH）"
+  git -C "$SCRIPT_DIR" add docs/ excluded.json
+  if ! git -C "$SCRIPT_DIR" diff --cached --quiet; then
+    git -C "$SCRIPT_DIR" commit -q -m "レポート公開 $TODAY vol.$VOL" || fail "コミットに失敗しました"
+  fi
+  PUSHED=0
+  for delay in 2 4 8 16; do
+    if git -C "$SCRIPT_DIR" push -u origin "$BRANCH" >/dev/null 2>&1; then PUSHED=1; break; fi
+    log "push に失敗。${delay}秒後に再試行します"
+    sleep "$delay"
+  done
+  [ "$PUSHED" = 1 ] || fail "要約ページの push に失敗しました（リンク切れを避けるため配信しません）"
+
+  # GitHub Pages のビルド完了を待つ（最大5分）。公開前に配信するとリンク切れになる
+  log "ページの公開反映を待機します: $PAGE_URL"
+  LIVE=0
+  for _ in $(seq 1 30); do
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -L "$PAGE_URL" || echo 000)"
+    if [ "$CODE" = "200" ]; then LIVE=1; break; fi
+    sleep 10
+  done
+  [ "$LIVE" = 1 ] || fail "ページが公開されません（$PAGE_URL）。GitHub Pages の設定を確認してください"
+  log "ページ公開を確認しました"
+fi
+
+# --- 7) LINE配信 ----------------------------------------------------------
+SEND_ARGS=(--mode flex --data "$DATA_FILE" --page-url "$PAGE_URL"
+           --date-jp "$DATE_JP" --vol "$VOL" --date "$TODAY")
 if [ "$DRY_RUN" = 1 ]; then
-  log "dry-run: 配信せず、分割後メッセージを表示します"
-  python3 "$SCRIPT_DIR/send_line.py" --file "$ARCHIVE_FILE" --date "$TODAY" --dry-run 2>&1 | tee -a "$LOG_FILE" \
+  log "dry-run: 配信せず、カード内容を表示します（ページURL: $PAGE_URL）"
+  python3 "$SCRIPT_DIR/send_line.py" "${SEND_ARGS[@]}" --dry-run 2>&1 | tee -a "$LOG_FILE" \
     || fail "send_line.py (dry-run) が失敗しました"
 else
-  log "LINE broadcast 配信を開始します"
-  python3 "$SCRIPT_DIR/send_line.py" --file "$ARCHIVE_FILE" --date "$TODAY" 2>&1 | tee -a "$LOG_FILE" \
-    || fail "LINE配信に失敗しました。次回実行時に同じ本文・同じRetry-Keyで再試行されます"
+  log "LINE配信を開始します"
+  python3 "$SCRIPT_DIR/send_line.py" "${SEND_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE" \
+    || fail "LINE配信に失敗しました。次回実行時に同じ内容・同じRetry-Keyで再試行されます"
   touch "$SENT_MARKER"
   log "配信完了"
 fi
