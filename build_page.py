@@ -86,25 +86,17 @@ INDEX = """<!doctype html>
 
 
 def parse_body(body: str):
-    """本文を「ヘッダー」「企業ブロック（【n】…）」「◆全体所感」に分解する。"""
-    blocks, current = [], []
-    for line in body.splitlines():
-        if DIVIDER_RE.match(line):
-            if current:
-                blocks.append("\n".join(current).strip())
-                current = []
-        else:
-            current.append(line)
-    if current:
-        blocks.append("\n".join(current).strip())
-    blocks = [b for b in blocks if b]
+    """本文を企業ブロック（【n】…）と全体所感（◆…）に分解する。
 
-    companies, summary = [], ""
-    for b in blocks:
-        if b.startswith("◆"):
-            summary = b
-        elif re.match(r"^【\d+】", b):
-            companies.append(b)
+    区切りは罫線ではなく「【n】」見出しで判定するので、罫線が無くても壊れない。
+    """
+    rest = "\n".join(body.strip().splitlines()[1:])
+    rest = re.sub(r"^─{3,}[ \t]*$\n?", "", rest, flags=re.M)
+    m = re.search(r"^◆.*$", rest, re.M)
+    summary = rest[m.start():].strip() if m else ""
+    area = rest[:m.start()] if m else rest
+    companies = [b.strip() for b in re.split(r"^(?=【\d+】)", area, flags=re.M)
+                 if b.strip().startswith("【")]
     return companies, summary
 
 

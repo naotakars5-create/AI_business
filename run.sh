@@ -121,61 +121,14 @@ PY
 
   # --- 3) 生成物を検証して archive/ に保存 --------------------------------
   # 本文とカード用JSONの両方をここで厳密に検証する。半端な状態でLINEに飛ばさない。
-  COMPANIES="$(python3 - "$TMP_DIR/report.raw" "$ARCHIVE_FILE" "$DATA_FILE" "$DATE_JP" "$VOL" \
-      2>"$TMP_DIR/validate.err" <<'PY'
-import json, re, sys
-raw = open(sys.argv[1], encoding="utf-8").read().strip()
-archive, data_path, date_jp, vol = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-
-def die(msg):
-    print(f"検証NG: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-if not raw:
-    die("生成結果が空")
-
-header = raw.splitlines()[0].strip()
-expect = f"【米国先行サービス→日本落とし込み】{date_jp} vol.{vol}"
-if header != expect:
-    die(f"1行目が不正: {header!r}（期待: {expect!r}）")
-
-m = re.search(r"^@@DATA$\s*(.+?)\s*^@@END$", raw, re.M | re.S)
-if not m:
-    die("@@DATA〜@@END ブロックが見つからない")
-try:
-    data = json.loads(m.group(1))
-except ValueError as e:
-    die(f"カード用JSONが壊れている: {e}")
-
-companies = data.get("companies")
-if not isinstance(companies, list) or not 3 <= len(companies) <= 5:
-    die(f"companies は3〜5件である必要がある（{len(companies) if isinstance(companies, list) else '不正'}）")
-for i, c in enumerate(companies, 1):
-    for key in ("name", "tagline", "card", "source_url"):
-        if not c.get(key):
-            die(f"companies[{i}] に {key} がない")
-    if not isinstance(c["card"], list) or not c["card"]:
-        die(f"companies[{i}] の card が配列でない")
-    if not str(c["source_url"]).startswith(("http://", "https://")):
-        die(f"companies[{i}] の source_url がURLでない: {c['source_url']!r}")
-
-body = raw[:m.start()].strip() + "\n"
-blocks = [b for b in re.split(r"^─{3,}\s*$", body, flags=re.M) if b.strip()]
-found = [b for b in blocks if re.match(r"^【\d+】", b.strip())]
-if len(found) != len(companies):
-    die(f"本文の企業ブロック数({len(found)})とcompanies件数({len(companies)})が不一致")
-for i in range(1, len(companies) + 1):
-    if f"【{i}】" not in body:
-        die(f"【{i}】のブロックが見つからない")
-if "**" in body or re.search(r"^#{1,6} ", body, re.M):
-    die("本文にMarkdown記法（** や #）が残っている")
-
-open(archive, "w", encoding="utf-8").write(body)
-with open(data_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-print(" | ".join(c["name"] for c in companies))
-PY
-  )" || { log "検証エラー: $(tr '\n' ' ' < "$TMP_DIR/validate.err" 2>/dev/null)"; fail "生成された本文が検証を通りませんでした"; }
+  COMPANIES="$(python3 "$SCRIPT_DIR/validate_report.py" "$TMP_DIR/report.raw" \
+      "$ARCHIVE_FILE" "$DATA_FILE" "$DATE_JP" "$VOL" 2>"$TMP_DIR/validate.err")" || {
+    # 生成物を残しておくと原因を追える（レポート本文のみ。秘匿情報は含まれない）
+    cp "$TMP_DIR/report.raw" "$LOG_DIR/failed-$TODAY.txt" 2>/dev/null || true
+    log "検証エラー: $(tr '\n' ' ' < "$TMP_DIR/validate.err" 2>/dev/null)"
+    log "生成物は $LOG_DIR/failed-$TODAY.txt に保存しました"
+    fail "生成された本文が検証を通りませんでした"
+  }
   log "archive に保存しました: $ARCHIVE_FILE"
 
   # --- 4) 今回の企業を excluded.json に追記（dry-run では更新しない） -----
