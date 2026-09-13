@@ -1,0 +1,86 @@
+# 毎週月曜 8:00 JST に米国先行サービスをリサーチし、要約ページを公開してLINEに配信する。
+# PCを起動しておく必要はない（GitHubのサーバー上で実行される）。
+#
+# 必要なシークレット（リポジトリの Settings → Secrets and variables → Actions で登録）:
+#   LINE_CHANNEL_ACCESS_TOKEN  必須。LINE Developersのチャネルアクセストークン（長期）
+#   CLAUDE_CODE_OAUTH_TOKEN    どちらか一方。Claude有料プランで `claude setup-token` で発行
+#   ANTHROPIC_API_KEY          どちらか一方。Anthropic APIキー（従量課金）
+name: 週次LINE配信
+
+on:
+  schedule:
+    # UTC表記。日曜23:00 UTC = 月曜8:00 JST
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '配信せずに内容だけ確認する（初回はこのままONで実行してください）'
+        type: boolean
+        default: true
+
+# docs/ と excluded.json を自動コミットするために書き込み権限が必要
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-line-broadcast
+  cancel-in-progress: false
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Claude Code CLI をインストール
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: 認証情報を確認
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APIKEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LINE: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+        run: |
+          # 値そのものは絶対に出力しない。有無だけを確認する
+          if [ -z "$OAUTH" ] && [ -z "$APIKEY" ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN か ANTHROPIC_API_KEY のどちらかをSecretsに登録してください"
+            exit 1
+          fi
+          if [ -z "$LINE" ]; then
+            echo "::error::LINE_CHANNEL_ACCESS_TOKEN をSecretsに登録してください"
+            exit 1
+          fi
+          echo "認証情報は登録済みです"
+
+      - name: .env を作成
+        env:
+          LINE: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+        run: printf 'LINE_CHANNEL_ACCESS_TOKEN=%s\n' "$LINE" > .env
+
+      - name: 実行
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # スケジュール実行は常に本番配信。手動実行は入力に従う（既定はdry-run）
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          chmod +x run.sh
+          ./run.sh $DRY
+
+      - name: 実行ログを保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            logs/
+            archive/
+          retention-days: 14
+          if-no-files-found: ignore

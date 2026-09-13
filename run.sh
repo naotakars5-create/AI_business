@@ -97,7 +97,11 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$EXCLUDED_JSON" \
 
 if [ "$SKIP_GEN" = 0 ]; then
   # --- 2) claude -p でリサーチ・本文生成 ----------------------------------
-  VOL=$(( $(find "$ARCHIVE_DIR" -maxdepth 1 -name '*.md' ! -name '*.dryrun.md' | wc -l) + 1 ))
+  # vol番号は「git管理下にある公開済みページ数 + 1」。archive/ はgit管理外なので、
+  # GitHub Actions のようにクローンし直す環境でも番号が巻き戻らない。
+  # dry-runで作った未コミットのページは数に入らない。
+  VOL=$(( $(git -C "$SCRIPT_DIR" ls-files 'docs/*.html' 2>/dev/null \
+            | grep -cE 'docs/[0-9]{4}-[0-9]{2}-[0-9]{2}\.html$') + 1 ))
   log "vol.$VOL としてレポートを生成します（日付: $DATE_JP）"
 
   python3 - "$SCRIPT_DIR/prompt.md" "$EXCLUDED_JSON" "$DATE_JP" "$VOL" > "$TMP_DIR/prompt.txt" <<'PY'

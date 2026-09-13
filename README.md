@@ -19,9 +19,29 @@ LINE公式アカウントの友だちに**カード形式（Flexカルーセル�
 | `archive/` | 生成レポート本文とカード用JSON（gitignore 済み） |
 | `logs/` | 実行ログ。7日より古いものは自動削除（gitignore 済み） |
 
-## セットアップ（運用するマシンで）
+## 運用方法は2通り（どちらか一方）
+
+### A. GitHub Actions で自動実行（推奨・PC不要）
+
+GitHubのサーバー上で毎週月曜 8:00 JST に実行される。PCを起動しておく必要がない。
+`.github/workflows/weekly.yml` が実体。
+
+**Secrets の登録**（リポジトリの Settings → Secrets and variables → Actions → New repository secret）
+
+| 名前 | 中身 |
+|---|---|
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Developers のチャネルアクセストークン（長期）。必須 |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude有料プランの場合。ターミナルで `claude setup-token` を実行して発行 |
+| `ANTHROPIC_API_KEY` | 上の代わりにAPIキー（従量課金）でも可 |
+
+下2つはどちらか一方でよい。登録後、Actions タブ →「週次LINE配信」→「Run workflow」で
+手動実行できる（`dry_run` を ON のままにすると配信せず内容だけ確認できる）。
+
+### B. 手元のマシンの cron で実行
 
 前提: `python3`（3.8+）、`claude` CLI（ログイン済み）、`git`、`curl`、`crontab`。
+
+#### セットアップ
 
 ```bash
 git clone https://github.com/naotakars5-create/AI_business
