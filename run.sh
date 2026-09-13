@@ -100,8 +100,11 @@ if [ "$SKIP_GEN" = 0 ]; then
   # vol番号は「git管理下にある公開済みページ数 + 1」。archive/ はgit管理外なので、
   # GitHub Actions のようにクローンし直す環境でも番号が巻き戻らない。
   # dry-runで作った未コミットのページは数に入らない。
-  VOL=$(( $(git -C "$SCRIPT_DIR" ls-files 'docs/*.html' 2>/dev/null \
-            | grep -cE 'docs/[0-9]{4}-[0-9]{2}-[0-9]{2}\.html$') + 1 ))
+  # grepは0件のとき終了コード1を返し、pipefail下ではそれが中断につながる。
+  # `|| true` で握りつぶす（grep -c は0件でも "0" を出力する）。
+  PUBLISHED=$(git -C "$SCRIPT_DIR" ls-files 'docs/*.html' 2>/dev/null \
+              | grep -cE 'docs/[0-9]{4}-[0-9]{2}-[0-9]{2}\.html$' || true)
+  VOL=$(( ${PUBLISHED:-0} + 1 ))
   log "vol.$VOL としてレポートを生成します（日付: $DATE_JP）"
 
   python3 - "$SCRIPT_DIR/prompt.md" "$EXCLUDED_JSON" "$DATE_JP" "$VOL" > "$TMP_DIR/prompt.txt" <<'PY'
@@ -114,14 +117,24 @@ sys.stdout.write(tpl.replace("{{EXCLUDED}}", lines)
                     .replace("{{VOL}}", sys.argv[4]))
 PY
 
-  CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
-  [ -n "$CLAUDE_BIN" ] || fail "claude CLI が見つかりません"
-  log "claude によるリサーチ・本文生成を開始（数分かかります）"
-  if ! "$CLAUDE_BIN" -p --allowedTools "WebSearch,WebFetch" \
-        < "$TMP_DIR/prompt.txt" > "$TMP_DIR/report.raw" 2> "$TMP_DIR/claude.err"; then
-    log "claude stderr（末尾）: $(tail -c 1000 "$TMP_DIR/claude.err" | tr '\n' ' ')"
+  # リサーチのエンジンを選ぶ。GEMINI_API_KEY があれば Gemini（無料枠・Google検索連携）、
+  # なければ claude CLI を使う。どちらも無ければここで中断する。
+  if [ -n "${GEMINI_API_KEY:-}" ]; then
+    ENGINE="Gemini"
+    GEN_CMD=(python3 "$SCRIPT_DIR/research_gemini.py")
+  else
+    CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
+    [ -n "$CLAUDE_BIN" ] || fail "リサーチ用の設定がありません（GEMINI_API_KEY か claude CLI のどちらかが必要）"
+    ENGINE="claude"
+    GEN_CMD=("$CLAUDE_BIN" -p --allowedTools "WebSearch,WebFetch")
+  fi
+  log "$ENGINE によるリサーチ・本文生成を開始（数分かかります）"
+  if ! "${GEN_CMD[@]}" < "$TMP_DIR/prompt.txt" > "$TMP_DIR/report.raw" 2> "$TMP_DIR/gen.err"; then
+    log "$ENGINE のエラー出力（末尾）: $(tail -c 1000 "$TMP_DIR/gen.err" | tr '\n' ' ')"
     fail "本文生成に失敗しました"
   fi
+  # 使用モデル名などの情報ログ（エラーでなくても出る）
+  [ -s "$TMP_DIR/gen.err" ] && log "$ENGINE: $(head -c 300 "$TMP_DIR/gen.err" | tr '\n' ' ')" || true
 
   # --- 3) 生成物を検証して archive/ に保存 --------------------------------
   # 本文とカード用JSONの両方をここで厳密に検証する。半端な状態でLINEに飛ばさない。

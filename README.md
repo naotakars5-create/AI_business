@@ -10,6 +10,7 @@ LINE公式アカウントの友だちに**カード形式（Flexカルーセル�
 |---|---|
 | `run.sh` | メインパイプライン（cron から起動） |
 | `prompt.md` | `claude -p` に渡すリサーチ指示テンプレート |
+| `research_gemini.py` | Gemini API（Google検索連携）でレポート本文を生成 |
 | `build_page.py` | 要約ページ（`docs/YYYY-MM-DD.html`）とバックナンバー一覧を生成 |
 | `send_line.py` | LINE broadcast 配信（Python 標準ライブラリのみ） |
 | `excluded.json` | 紹介済み企業リスト（毎回自動追記され、以後除外される） |
@@ -31,11 +32,16 @@ GitHubのサーバー上で毎週月曜 8:00 JST に実行される。PCを起�
 | 名前 | 中身 |
 |---|---|
 | `LINE_CHANNEL_ACCESS_TOKEN` | LINE Developers のチャネルアクセストークン（長期）。必須 |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude有料プランの場合。ターミナルで `claude setup-token` を実行して発行 |
-| `ANTHROPIC_API_KEY` | 上の代わりにAPIキー（従量課金）でも可 |
+| `GEMINI_API_KEY` | リサーチ用。Google AI Studio（https://aistudio.google.com/apikey）で無料発行 |
 
-下2つはどちらか一方でよい。登録後、Actions タブ →「週次LINE配信」→「Run workflow」で
-手動実行できる（`dry_run` を ON のままにすると配信せず内容だけ確認できる）。
+登録後、Actions タブ →「週次LINE配信」→「Run workflow」で手動実行できる
+（`dry_run` を ON のままにすると配信せず内容だけ確認できる）。
+
+リサーチのエンジンは `GEMINI_API_KEY` があれば Gemini（Google検索グラウンディング付き、
+無料枠で検索連携500回/日）、無ければ `claude` CLI を使う。Claudeを使う場合は
+`CLAUDE_CODE_OAUTH_TOKEN`（`claude setup-token` で発行）か `ANTHROPIC_API_KEY` を登録する。
+モデル名は固定せず、ListModels で実際に使えるものから自動選択する
+（`GEMINI_MODEL` で明示指定も可）。
 
 ### B. 手元のマシンの cron で実行
 
