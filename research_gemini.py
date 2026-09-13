@@ -48,40 +48,48 @@ def api(key: str, path: str, payload=None):
         return e.code, body
 
 
-def pick_model(key: str) -> str:
-    """使えるモデルの中から、検索グラウンディングに向いたものを自動で選ぶ。"""
+def candidate_models(key: str) -> list:
+    """使えるモデルを新しい順に並べて返す。
+
+    最新モデルには無料枠が無いことがある（429 RESOURCE_EXHAUSTED）。
+    そのため1つに決め打ちせず、新しい順に試して最初に通ったものを使う。
+    """
     if os.environ.get("GEMINI_MODEL"):
-        return os.environ["GEMINI_MODEL"]
+        return [os.environ["GEMINI_MODEL"]]
     status, body = api(key, "models?pageSize=200")
     if status != 200:
         die(f"モデル一覧の取得に失敗 (HTTP {status}): {body}")
 
-    def score(name: str):
+    supported = {m["name"]: m.get("supportedGenerationMethods", [])
+                 for m in body.get("models", [])}
+
+    scored = []
+    for name, methods in supported.items():
         base = name.split("/")[-1]
-        if "generateContent" not in supported.get(name, []):
-            return None
+        if "generateContent" not in methods:
+            continue
         # 用途違いのモデルを除外
         if re.search(r"embedding|aqa|vision|tts|image|audio|native|live|robotics", base):
-            return None
+            continue
         m = re.search(r"gemini-(\d+(?:\.\d+)?)", base)
         if not m:
-            return None
+            continue
         ver = float(m.group(1))
         # flash を優先（無料枠が大きい）。lite は品質が落ちるので後回し
         kind = 2 if ("flash" in base and "lite" not in base) else (1 if "pro" in base else 0)
         stable = 0 if re.search(r"preview|exp|thinking", base) else 1
-        return (stable, ver, kind)
+        scored.append(((stable, ver, kind), base))
 
-    supported = {m["name"]: m.get("supportedGenerationMethods", [])
-                 for m in body.get("models", [])}
-    best, best_score = None, None
-    for name in supported:
-        s = score(name)
-        if s and (best_score is None or s > best_score):
-            best, best_score = name.split("/")[-1], s
-    if not best:
+    if not scored:
         die("利用可能なGeminiモデルが見つかりませんでした")
-    return best
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # 同名の重複を除きつつ上位から最大8件試す
+    seen, ordered = set(), []
+    for _, base in scored:
+        if base not in seen:
+            seen.add(base)
+            ordered.append(base)
+    return ordered[:8]
 
 
 def main() -> None:
@@ -93,16 +101,28 @@ def main() -> None:
     if not prompt.strip():
         die("プロンプトが空です")
 
-    model = pick_model(key)
-    print(f"使用モデル: {model}", file=sys.stderr)
-
-    status, body = api(key, f"models/{model}:generateContent", {
+    models = candidate_models(key)
+    payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 16384},
-    })
-    if status != 200:
+    }
+
+    body = None
+    for model in models:
+        status, body = api(key, f"models/{model}:generateContent", payload)
+        if status == 200:
+            print(f"使用モデル: {model}", file=sys.stderr)
+            break
+        # 429=無料枠が無い/使い切った, 404=そのモデルでは使えない → 次の候補へ
+        if status in (404, 429):
+            reason = "無料枠なし/上限到達" if status == 429 else "利用不可"
+            print(f"{model}: {reason} (HTTP {status}) のため次の候補を試します", file=sys.stderr)
+            continue
         die(f"生成に失敗 (HTTP {status}): {body}")
+    else:
+        die("試した全モデルで生成できませんでした（無料枠の上限に達している可能性があります）。"
+            f"候補: {', '.join(models)} / 最後の応答: {body}")
 
     candidates = body.get("candidates") or []
     if not candidates:
