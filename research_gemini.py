@@ -12,14 +12,22 @@ APIの形式（2026-09-13 に公式ドキュメント・リファレンスで確
 
 モデル名は変わりうるので暗記で決め打ちせず、ListModels で実際に使えるものを調べて選ぶ。
 GEMINI_MODEL 環境変数で明示指定も可能。
+
+2段構えで動く:
+  1. Google検索グラウンディング付きで生成を試す
+  2. 全モデルが429（無料枠なし）なら、こちらでRSSから実際の記事を取得して
+     本文に添え、グラウンディング無しで生成する。出典URLは取得した記事のものに限定され、
+     モデルがURLを創作できないぶん、むしろ確実になる
 """
 
+import html as html_mod
 import json
 import os
 import re
 import sys
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 TIMEOUT = 600  # 検索グラウンディング付きは時間がかかる
@@ -28,6 +36,74 @@ TIMEOUT = 600  # 検索グラウンディング付きは時間がかかる
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+FEEDS = [
+    ("TechCrunch スタートアップ", "https://techcrunch.com/category/startups/feed/"),
+    ("Crunchbase News", "https://news.crunchbase.com/feed/"),
+    ("Product Hunt", "https://www.producthunt.com/feed"),
+    ("Y Combinator Launches", "https://www.ycombinator.com/launches/feed.xml"),
+]
+UA = "Mozilla/5.0 (compatible; weekly-report-bot)"
+
+
+def strip_tags(text: str) -> str:
+    return re.sub(r"\s+", " ", html_mod.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
+
+
+def fetch_feed(url: str, limit: int = 15) -> list:
+    """RSS/Atom を取得して記事一覧にする。失敗しても例外を投げず空を返す。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as res:
+            root = ET.fromstring(res.read())
+    except Exception as e:
+        print(f"フィード取得失敗 {url}: {e}", file=sys.stderr)
+        return []
+
+    items = []
+    # RSS
+    for node in root.iter("item"):
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip()
+        desc = strip_tags(node.findtext("description") or "")
+        date = (node.findtext("pubDate") or "").strip()
+        if title and link:
+            items.append({"title": title, "url": link, "date": date, "summary": desc[:400]})
+    # Atom
+    if not items:
+        ns = "{http://www.w3.org/2005/Atom}"
+        for node in root.iter(f"{ns}entry"):
+            title = (node.findtext(f"{ns}title") or "").strip()
+            link_el = node.find(f"{ns}link")
+            link = (link_el.get("href") if link_el is not None else "") or ""
+            desc = strip_tags(node.findtext(f"{ns}summary") or node.findtext(f"{ns}content") or "")
+            date = (node.findtext(f"{ns}updated") or node.findtext(f"{ns}published") or "").strip()
+            if title and link:
+                items.append({"title": title, "url": link, "date": date, "summary": desc[:400]})
+    return items[:limit]
+
+
+def build_sources_block() -> str:
+    """各フィードから記事を集めてプロンプトに添える文字列を作る。"""
+    lines, total = [], 0
+    for name, url in FEEDS:
+        items = fetch_feed(url)
+        if not items:
+            continue
+        lines.append(f"\n## {name}")
+        for it in items:
+            lines.append(f"- タイトル: {it['title']}")
+            lines.append(f"  URL: {it['url']}")
+            if it["date"]:
+                lines.append(f"  日付: {it['date']}")
+            if it["summary"]:
+                lines.append(f"  概要: {it['summary']}")
+            total += 1
+    if total == 0:
+        return ""
+    print(f"記事を{total}件取得しました", file=sys.stderr)
+    return "\n".join(lines)
 
 
 def api(key: str, path: str, payload=None):
@@ -102,27 +178,52 @@ def main() -> None:
         die("プロンプトが空です")
 
     models = candidate_models(key)
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 16384},
-    }
+    config = {"temperature": 0.4, "maxOutputTokens": 16384}
 
-    body = None
-    for model in models:
-        status, body = api(key, f"models/{model}:generateContent", payload)
-        if status == 200:
-            print(f"使用モデル: {model}", file=sys.stderr)
-            break
-        # 429=無料枠が無い/使い切った, 404=そのモデルでは使えない → 次の候補へ
-        if status in (404, 429):
-            reason = "無料枠なし/上限到達" if status == 429 else "利用不可"
-            print(f"{model}: {reason} (HTTP {status}) のため次の候補を試します", file=sys.stderr)
-            continue
-        die(f"生成に失敗 (HTTP {status}): {body}")
-    else:
-        die("試した全モデルで生成できませんでした（無料枠の上限に達している可能性があります）。"
-            f"候補: {', '.join(models)} / 最後の応答: {body}")
+    def attempt(text: str, grounded: bool):
+        """候補モデルを順に試す。(成功したbody, 最後のstatus, 最後のbody) を返す。"""
+        payload = {"contents": [{"parts": [{"text": text}]}],
+                   "generationConfig": config}
+        if grounded:
+            payload["tools"] = [{"google_search": {}}]
+        last_status, last_body = None, None
+        for model in models:
+            status, body = api(key, f"models/{model}:generateContent", payload)
+            last_status, last_body = status, body
+            if status == 200:
+                print(f"使用モデル: {model}"
+                      f"（{'Google検索連携あり' if grounded else '取得済み記事から生成'}）",
+                      file=sys.stderr)
+                return body, status, body
+            # 429=無料枠が無い/使い切った, 404=そのモデルでは使えない → 次の候補へ
+            if status in (404, 429):
+                reason = "無料枠なし/上限到達" if status == 429 else "利用不可"
+                print(f"{model}: {reason} (HTTP {status})", file=sys.stderr)
+                continue
+            die(f"生成に失敗 (HTTP {status}): {body}")
+        return None, last_status, last_body
+
+    # 1段目: Google検索グラウンディング付き
+    body, status, last_body = attempt(prompt, grounded=True)
+
+    # 2段目: 検索連携に無料枠が無い場合、こちらで記事を取得して渡す
+    if body is None:
+        print("検索連携では生成できませんでした。記事を自分で取得して再試行します",
+              file=sys.stderr)
+        sources = build_sources_block()
+        if not sources:
+            die("記事の取得にも失敗しました（ネットワークを確認してください）。"
+                f"検索連携の最後の応答: {last_body}")
+        augmented = (prompt + "\n\n# 実際に取得した最新記事一覧（この中から選ぶこと）\n"
+                     + sources +
+                     "\n\n# 重要な追加ルール\n"
+                     "- 上の一覧に無い企業は取り上げないこと\n"
+                     "- source_url は上の一覧に書かれたURLをそのまま使うこと。URLを創作しない\n"
+                     "- 一覧の情報だけでは調達額などが分からない場合は「未公開」と書くこと\n")
+        body, status, last_body = attempt(augmented, grounded=False)
+        if body is None:
+            die("記事を渡した再試行でも生成できませんでした（APIキーの無料枠が"
+                f"利用できない可能性があります）。最後の応答: {last_body}")
 
     candidates = body.get("candidates") or []
     if not candidates:
