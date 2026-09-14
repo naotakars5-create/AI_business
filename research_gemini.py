@@ -31,8 +31,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-TIMEOUT = 600  # 検索グラウンディング付きは時間がかかる
-TRANSIENT = (500, 502, 503, 504)  # Gemini側の一時的な不調。待てば直る
+TIMEOUT = 180        # 1リクエストの上限。長すぎるとリトライの余地が無くなる
+DEADLINE_SEC = 900   # 生成全体の制限時間。これを超えたら諦めてエラーにする
+TRANSIENT = (0, 500, 502, 503, 504)  # 0=通信エラー/タイムアウト。いずれも待てば直りうる
 
 
 def die(msg: str) -> None:
@@ -124,6 +125,9 @@ def api(key: str, path: str, payload=None):
         body = e.read().decode("utf-8", "replace")
         # APIキーがURLやログに漏れないよう、ボディのみ返す
         return e.code, body
+    except Exception as e:
+        # タイムアウト・接続断など。status 0 として一時的エラー扱いにし、上位で再試行する
+        return 0, f"通信エラー: {type(e).__name__}: {e}"
 
 
 def candidate_models(key: str) -> list:
@@ -179,19 +183,28 @@ def main() -> None:
     if not prompt.strip():
         die("プロンプトが空です")
 
+    deadline = time.time() + DEADLINE_SEC
     models = candidate_models(key)
-    config = {"temperature": 0.4, "maxOutputTokens": 16384}
+    config = {"temperature": 0.4, "maxOutputTokens": 8192}
 
-    def attempt(text: str, grounded: bool):
-        """候補モデルを順に試す。(成功したbody, 最後のstatus, 最後のbody) を返す。"""
+    def attempt(text: str, grounded: bool, until: float):
+        """候補モデルを順に試す。(成功したbody, 最後のstatus, 最後のbody) を返す。
+
+        until は、この段階に許された終了時刻。超えたら次の段階に譲る。
+        """
         payload = {"contents": [{"parts": [{"text": text}]}],
                    "generationConfig": config}
         if grounded:
             payload["tools"] = [{"google_search": {}}]
         last_status, last_body = None, None
         for model in models:
-            # 5xx はGemini側の一時的な混雑。少し待って同じモデルで再試行する
+            if time.time() > until:
+                print("制限時間に達したため打ち切ります", file=sys.stderr)
+                break
+            # 5xx・通信エラーは一時的なもの。少し待って同じモデルで再試行する
             for wait in (0, 20, 60):
+                if wait and time.time() + wait > until:
+                    break
                 if wait:
                     print(f"{model}: 混雑のため{wait}秒待って再試行します", file=sys.stderr)
                     time.sleep(wait)
@@ -206,14 +219,17 @@ def main() -> None:
                 return body, status, body
             # 429=無料枠が無い/使い切った, 404=使えない, 5xx=混雑が続く → 次の候補へ
             if status in (404, 429) or status in TRANSIENT:
-                reason = {429: "無料枠なし/上限到達", 404: "利用不可"}.get(status, "混雑（5xx）")
+                reason = {429: "無料枠なし/上限到達", 404: "利用不可",
+                          0: "通信エラー/タイムアウト"}.get(status, "混雑（5xx）")
                 print(f"{model}: {reason} (HTTP {status})", file=sys.stderr)
                 continue
             die(f"生成に失敗 (HTTP {status}): {body}")
         return None, last_status, last_body
 
-    # 1段目: Google検索グラウンディング付き
-    body, status, last_body = attempt(prompt, grounded=True)
+    # 1段目: Google検索グラウンディング付き。
+    # 無料枠だと全モデル429で即座に終わる。長引く場合は2段目に時間を譲る
+    body, status, last_body = attempt(prompt, grounded=True,
+                                      until=min(time.time() + 240, deadline))
 
     # 2段目: 検索連携に無料枠が無い場合、こちらで記事を取得して渡す
     if body is None:
@@ -229,7 +245,7 @@ def main() -> None:
                      "- 上の一覧に無い企業は取り上げないこと\n"
                      "- source_url は上の一覧に書かれたURLをそのまま使うこと。URLを創作しない\n"
                      "- 一覧の情報だけでは調達額などが分からない場合は「未公開」と書くこと\n")
-        body, status, last_body = attempt(augmented, grounded=False)
+        body, status, last_body = attempt(augmented, grounded=False, until=deadline)
         if body is None:
             die("記事を渡した再試行でも生成できませんでした（APIキーの無料枠が"
                 f"利用できない可能性があります）。最後の応答: {last_body}")
