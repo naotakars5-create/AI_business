@@ -1,16 +1,16 @@
-# 毎週月曜 8:00 JST に米国先行サービスをリサーチし、要約ページを公開してLINEに配信する。
+# 毎週火曜・金曜 8:00 JST に米国先行サービスをリサーチし、要約ページを公開してLINEに配信する。
 # PCを起動しておく必要はない（GitHubのサーバー上で実行される）。
 #
 # 必要なシークレット（リポジトリの Settings → Secrets and variables → Actions で登録）:
 #   LINE_CHANNEL_ACCESS_TOKEN  必須。LINE Developersのチャネルアクセストークン（長期）
 #   GEMINI_API_KEY             リサーチ用。Google AI Studio で無料発行
 #   （Geminiの代わりに CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY でも動く）
-name: 週次LINE配信
+name: 定期LINE配信（火・金）
 
 on:
   schedule:
-    # UTC表記。日曜23:00 UTC = 月曜8:00 JST
-    - cron: '0 23 * * 0'
+    # UTC表記。月曜23:00 UTC = 火曜8:00 JST、木曜23:00 UTC = 金曜8:00 JST
+    - cron: '0 23 * * 1,4'
   workflow_dispatch:
     inputs:
       dry_run:

@@ -2,6 +2,7 @@
 """LINE公式アカウントへの一斉配信（broadcast）スクリプト。標準ライブラリのみ使用。
 
 配信形式: Flex Message のカルーセル（横スクロールするカード 3〜5枚）。
+  内訳は企業2〜4社ぶん + 「レポート全文」カード1枚。
 各カードには「要約を見る」（GitHub Pages の該当企業へのアンカーリンク）と
 「元記事」（出典記事URL）の2つのボタンを付ける。
 
@@ -11,7 +12,7 @@ LINE Messaging API の制限値（2026-08-24 に公式ドキュメント・公�
 - Flex Message の altText は最大400文字、カルーセルのJSON全体は最大50KB
   https://developers.line.biz/ja/docs/messaging-api/using-flex-messages/
 - カルーセルに入れられるバブル数の上限はドキュメント上10〜12。
-  本スクリプトは仕様どおり最大5枚しか作らないため、上限には決して達しない
+  本スクリプトは最大5枚しか作らないため、上限には決して達しない
 - テキストメッセージ text は最大5,000文字（--mode text 用）
   https://developers.line.biz/ja/reference/messaging-api/#text-message
 - X-Line-Retry-Key: 任意の方法で生成したUUID。初回リクエストから24時間有効で、
@@ -45,7 +46,7 @@ SAFETY_LIMIT = 4800       # 「（n/m）」と安全マージンを引いた実�
 MAX_MESSAGES_PER_REQ = 5  # 1リクエストのメッセージオブジェクト数上限
 ALT_TEXT_LIMIT = 400      # Flex の altText 上限
 FLEX_JSON_LIMIT = 50_000  # カルーセルJSONのバイト上限（50KB）
-MIN_CARDS, MAX_CARDS = 3, 5
+MIN_CARDS, MAX_CARDS = 2, 4
 
 DIVIDER = "─────"
 DIVIDER_RE = re.compile(r"^─{3,}\s*$")
@@ -131,7 +132,7 @@ def build_flex_message(data: dict, page_url: str, date_jp: str, vol) -> dict:
         "type": "bubble", "size": "mega",
         "body": {"type": "box", "layout": "vertical", "paddingAll": "20px",
                  "justifyContent": "center", "spacing": "md", "contents": [
-                     _text("今週のレポート全文", weight="bold", size="lg", color="#1A1D21"),
+                     _text("今回のレポート全文", weight="bold", size="lg", color="#1A1D21"),
                      _text(f"{len(companies)}社の詳細・調達額・日本での壁を"
                            "まとめて読めます", size="sm", color="#8C939C"),
                  ]},

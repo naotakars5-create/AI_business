@@ -13,7 +13,7 @@ import json
 import re
 import sys
 
-MIN_COMPANIES, MAX_COMPANIES = 3, 5
+MIN_COMPANIES, MAX_COMPANIES = 2, 4
 DIVIDER = "─────"
 
 
