@@ -25,12 +25,14 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 TIMEOUT = 600  # 検索グラウンディング付きは時間がかかる
+TRANSIENT = (500, 502, 503, 504)  # Gemini側の一時的な不調。待てば直る
 
 
 def die(msg: str) -> None:
@@ -188,16 +190,23 @@ def main() -> None:
             payload["tools"] = [{"google_search": {}}]
         last_status, last_body = None, None
         for model in models:
-            status, body = api(key, f"models/{model}:generateContent", payload)
-            last_status, last_body = status, body
+            # 5xx はGemini側の一時的な混雑。少し待って同じモデルで再試行する
+            for wait in (0, 20, 60):
+                if wait:
+                    print(f"{model}: 混雑のため{wait}秒待って再試行します", file=sys.stderr)
+                    time.sleep(wait)
+                status, body = api(key, f"models/{model}:generateContent", payload)
+                last_status, last_body = status, body
+                if status not in TRANSIENT:
+                    break
             if status == 200:
                 print(f"使用モデル: {model}"
                       f"（{'Google検索連携あり' if grounded else '取得済み記事から生成'}）",
                       file=sys.stderr)
                 return body, status, body
-            # 429=無料枠が無い/使い切った, 404=そのモデルでは使えない → 次の候補へ
-            if status in (404, 429):
-                reason = "無料枠なし/上限到達" if status == 429 else "利用不可"
+            # 429=無料枠が無い/使い切った, 404=使えない, 5xx=混雑が続く → 次の候補へ
+            if status in (404, 429) or status in TRANSIENT:
+                reason = {429: "無料枠なし/上限到達", 404: "利用不可"}.get(status, "混雑（5xx）")
                 print(f"{model}: {reason} (HTTP {status})", file=sys.stderr)
                 continue
             die(f"生成に失敗 (HTTP {status}): {body}")
